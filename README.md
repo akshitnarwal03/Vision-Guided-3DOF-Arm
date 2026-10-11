@@ -1,10 +1,202 @@
-# Camera Based Hand Tracking Robotic Arm
+# Vision Guided 3DOF Robotic Arm
 
-A Stage 1, three-servo robotic arm controller for Arduino Uno/Nano class boards, MG995 positional servos, a USB camera, and a Windows Python host. The base corrects left/right image error. Shoulder and elbow move in opposite calibrated directions to correct up/down error while approximately preserving camera pitch. Tracking begins only after the operator presses `t`.
+A camera-guided robotic arm that keeps a detected hand near the center of its view. The project combines real-time hand landmark detection on a host computer with safety-constrained motion control on an Arduino.
 
-This repository includes Arduino firmware, a manual calibration tool, MediaPipe hand tracking, a preview UI, and unit tests. Distance tracking is reserved for a later stage; the disabled `tof.py` adapter does not affect Stage 1.
+The arm has three controlled degrees of freedom:
 
-## Hardware and wiring
+- **Base yaw** tracks horizontal hand movement.
+- **Shoulder pitch** and **elbow pitch** move together to track vertical hand movement while approximately preserving camera pitch.
+- A USB camera mounted on the final link provides continuous visual feedback.
+
+Stage 1 implements image-based left/right and up/down tracking. Distance regulation with a Time-of-Flight sensor is reserved for Stage 2.
+
+## Technology stack
+
+| Layer | Technology | Purpose |
+|---|---|---|
+| Vision | MediaPipe Hand Landmarker Full | Detects up to two hands and returns 21 normalized landmarks per hand |
+| Image processing | OpenCV | Captures camera frames and renders the diagnostic interface |
+| Host control | Python 3.10–3.12 | Runs selection, filtering, control, configuration, and state supervision |
+| Configuration | YAML | Stores camera, serial, controller, and calibrated servo settings |
+| Communication | PySerial | Exchanges newline-terminated commands with Arduino at 115200 baud |
+| Firmware | Arduino C++ | Enforces limits, smooths movement, stores calibration, and runs the watchdog |
+| Actuation | Arduino Servo library | Generates positional PWM commands for three MG995 servos |
+| Persistence | Arduino EEPROM | Stores confirmed firmware joint limits with a checksum |
+| Verification | Python unittest | Tests control, filtering, configuration, protocol, and state transitions |
+
+The current implementation uses MediaPipe's default CPU delegate. It does not use ONNX Runtime and does not automatically select a GPU.
+
+## System architecture
+
+~~~mermaid
+flowchart LR
+    CAM[USB camera] --> CV[OpenCV frame capture]
+    CV --> MP[MediaPipe Hand Landmarker]
+    MP --> SELECT[Target selection]
+    SELECT --> FILTER[Jump rejection and EMA]
+    FILTER --> ERROR[Normalized image error]
+    ERROR --> CTRL[Visual servo controller]
+    CTRL --> HOSTLIMIT[Host rate and angle limits]
+    HOSTLIMIT --> SERIAL[USB serial protocol]
+    SERIAL --> FW[Arduino safety controller]
+    FW --> PROFILE[Velocity and acceleration profile]
+    PROFILE --> SERVOS[Three MG995 servos]
+    SERVOS --> ARM[Camera pose changes]
+    ARM --> CAM
+
+    CONFIG[YAML configuration] --> CV
+    CONFIG --> FILTER
+    CONFIG --> CTRL
+    STATE[Runtime state machine] --> CTRL
+    STATE --> SERIAL
+    EEPROM[EEPROM joint limits] --> FW
+~~~
+
+The host performs perception and decides where the arm should move. The Arduino remains the final motion boundary: it validates commands, rejects angles outside stored limits, smooths the requested trajectory, and freezes movement when communication becomes stale.
+
+## Vision and target model
+
+### Hand landmark detection
+
+The project uses Google's **MediaPipe Hand Landmarker Full** float16 task model in video mode. Video mode reuses tracking information between frames, reducing how often the more expensive palm detector must run.
+
+Each detected hand contains 21 normalized landmarks. The controller follows a palm center instead of a fingertip because finger articulation would create unnecessary arm movement. The palm center is the mean of the wrist and four finger MCP joints:
+
+~~~text
+P = (L0 + L5 + L9 + L13 + L17) / 5
+~~~
+
+Here, Li = (xi, yi) is a normalized landmark coordinate and P = (px, py) is the raw palm center.
+
+### Multiple-hand selection
+
+When two hands are visible:
+
+1. The hand closest to the previous target center remains selected.
+2. When no previous target exists, the hand with the highest confidence is selected.
+3. A distant replacement hand is ignored until the previous target has been absent for the configured loss threshold.
+
+This gives the target identity persistence and prevents rapid switching when two hands cross.
+
+### Measurement filtering
+
+An exponential moving average reduces landmark jitter:
+
+~~~text
+P_filtered[k] = alpha * P_raw[k] + (1 - alpha) * P_filtered[k-1]
+~~~
+
+The default alpha is 0.25. Smaller values provide more smoothing but add response delay.
+
+A single displacement larger than the configured jump threshold is rejected. A new position must appear consistently for multiple frames before it is accepted. The filter resets after sustained target loss.
+
+## Visual servo control model
+
+This is an **image-based visual servo system**. It minimizes hand-position error in the camera image rather than reconstructing a global 3D hand position.
+
+### Normalized image error
+
+~~~text
+error_x = filtered_hand_x - target_x
+error_y = filtered_hand_y - target_y
+~~~
+
+Positive error_x means the hand appears to the right of the target. Positive error_y means it appears below the target. Calibrated direction multipliers convert those image errors into the correct physical servo directions.
+
+### Deadband
+
+Small errors inside the center window are treated as zero:
+
+~~~text
+error_axis = 0, when abs(error_axis) <= deadband_axis
+~~~
+
+This prevents continuous correction caused by landmark noise, servo backlash, and camera vibration.
+
+### Horizontal controller
+
+The base uses proportional incremental control:
+
+~~~text
+delta_base = direction_base * gain_base * error_x * dt
+~~~
+
+The controller measures dt with a monotonic clock, caps unusually large frame intervals, limits each update, and clamps the resulting target to the calibrated base range.
+
+### Coordinated vertical controller
+
+Shoulder and elbow receive opposing physical rotations so the camera changes height while approximately preserving final-link pitch:
+
+~~~text
+vertical_delta = gain_vertical * error_y * dt
+
+delta_shoulder = direction_shoulder * vertical_delta
+delta_elbow    = -direction_elbow * vertical_delta * coupling_ratio
+~~~
+
+The initial coupling ratio is 1.0 and can be tuned for the real linkage and servo mounting. This is a calibrated local approximation rather than full inverse kinematics.
+
+When either planar joint approaches a limit, the controller scales both increments by the same fraction. This maintains shoulder/elbow coupling instead of independently clipping one joint and abruptly changing camera pitch.
+
+## Commanded motion model
+
+MG995 servos accept position commands but do not return their actual shaft position. The project smooths the **commanded trajectory**; it cannot measure servo lag, backlash, load, a stall, or a joint displaced by hand.
+
+The host first limits the maximum target change per update. The Arduino adds bounded velocity and acceleration. For each joint, it calculates the maximum speed from which it can still stop at the target:
+
+~~~text
+v_stop = sqrt(2 * max_acceleration * abs(position_error))
+v_desired = sign(position_error) * min(max_speed, v_stop)
+~~~
+
+Velocity changes are acceleration-limited:
+
+~~~text
+delta_v = clamp(v_desired - v_current,
+                -max_acceleration * dt,
+                 max_acceleration * dt)
+~~~
+
+| Firmware parameter | Default |
+|---|---:|
+| Motion update period | 20 ms |
+| Maximum commanded speed | 35 degrees/s |
+| Maximum commanded acceleration | 90 degrees/s² |
+| Serial watchdog timeout | 750 ms |
+
+The stopping-speed term causes gradual braking near the target and reduces sudden velocity reversals when new targets arrive.
+
+## Runtime state machine
+
+~~~mermaid
+stateDiagram-v2
+    [*] --> STARTUP
+    STARTUP --> HOMING: configuration and serial valid
+    HOMING --> IDLE: home motion complete
+    IDLE --> TRACKING: operator presses t
+    TRACKING --> IDLE: operator presses t
+    TRACKING --> HAND_LOST: loss threshold reached
+    HAND_LOST --> TRACKING: stable reacquisition
+    TRACKING --> LIMITED: joint reaches limit
+    LIMITED --> TRACKING: movement away from limit
+    STARTUP --> FAULT: initialization failure
+    TRACKING --> FAULT: camera serial or operator stop
+    HAND_LOST --> FAULT: camera or serial failure
+    LIMITED --> FAULT: camera or serial failure
+    FAULT --> IDLE: explicit reset
+~~~
+
+## Layered safety model
+
+- Tracking is disabled at startup and begins only after the operator presses t.
+- The host sends HOLD after sustained hand loss and stops changing targets.
+- Firmware rejects malformed commands and angles outside its stored limits.
+- Confirmed joint limits are stored in Arduino EEPROM, independent of the host YAML file.
+- A stale serial connection cancels the in-progress trajectory and holds the current commanded angle.
+- Normal shutdown sends HOLD; it does not release servo torque automatically.
+- Calibration never discovers limits by intentionally driving a servo into a stall.
+
+## Hardware specifications and wiring
 
 | Device | Default signal connection |
 |---|---|
