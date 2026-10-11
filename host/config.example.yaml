@@ -1,0 +1,36 @@
+serial:
+  port: auto
+  baud_rate: 115200
+  command_rate_hz: 20
+  timeout_ms: 750
+camera:
+  index: 0
+  width: 640
+  height: 480
+  mirror_preview: false
+vision:
+  model_path: models/hand_landmarker.task
+  detection_confidence: 0.6
+  tracking_confidence: 0.6
+  max_hands: 2
+  lost_frame_count: 5
+  reacquire_frame_count: 3
+  jump_threshold_normalized: 0.25
+  jump_confirm_frames: 2
+tracking:
+  target_x_normalized: 0.5
+  target_y_normalized: 0.5
+  deadband_x_normalized: 0.04
+  deadband_y_normalized: 0.05
+  base_gain_deg_per_second: 24.0
+  vertical_gain_deg_per_second: 20.0
+  shoulder_elbow_ratio: 1.0
+  max_angle_change_per_update: 1.5
+  ema_alpha: 0.25
+servos:
+  base: {pin: 9, home: 90, minimum: 60, maximum: 120, direction: 1}
+  shoulder: {pin: 10, home: 90, minimum: 60, maximum: 120, direction: 1}
+  elbow: {pin: 11, home: 90, minimum: 60, maximum: 120, direction: 1}
+tof:
+  enabled: false
+
