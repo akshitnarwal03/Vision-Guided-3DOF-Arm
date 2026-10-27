@@ -10,6 +10,8 @@ The arm has three controlled degrees of freedom:
 
 Stage 1 implements image-based left/right and up/down tracking. Distance regulation with a Time-of-Flight sensor is reserved for Stage 2.
 
+<img width="862" height="1030" alt="Screenshot 2026-10-27 131630" src="https://github.com/user-attachments/assets/b4188cc8-5077-461c-b4fe-8cbe6e29181d" />
+
 ## Technology stack
 
 | Layer | Technology | Purpose |
